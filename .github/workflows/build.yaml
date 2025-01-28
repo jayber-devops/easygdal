@@ -28,16 +28,14 @@ jobs:
             fail-fast: false
         steps:
             - uses: actions/checkout@v4
-            - name: Set up QEMU # Enables building Linux aarch64 (ARM) wheels
-              if: runner.os == 'Linux'
-              uses: docker/setup-qemu-action@v3
-              with:
-                platforms: all
             - uses: conda-incubator/setup-miniconda@v3
               with:
                 auto-update-conda: true
             - name: Install GDAL
-              run: conda install -c conda-forge libgdal=$GDAL_VERSION
+              id: install-gdal
+              run: |
+                conda install -c conda-forge libgdal=$GDAL_VERSION
+                echo "GDAL_BIN=$CONDA_PREFIX/bin" >> $GITHUB_OUTPUT
             - name: Download/unpack GDAL Python source distribution
               run: |
                 curl -L -o gdal.tar.gz https://pypi.io/packages/source/g/gdal/gdal-$GDAL_VERSION.tar.gz
@@ -45,9 +43,7 @@ jobs:
             - name: Build wheels
               uses: pypa/cibuildwheel@v2.22
               env:
-                # configure cibuildwheel to build native archs ('auto'), and some
-                # emulated ones
-                CIBW_ARCHS_LINUX: auto aarch64 ppc64le s390x
+                CIBW_ENVIRONMENT: PATH=${{ steps.install-gdal.outputs.GDAL_BIN }}:$PATH
               with:
                 package-dir: gdal-$GDAL_VERSION
             - uses: actions/upload-artifact@v4
