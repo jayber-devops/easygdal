@@ -38,14 +38,14 @@ jobs:
                 echo "GDAL_BIN=$CONDA_PREFIX/bin" >> $GITHUB_OUTPUT
             - name: Download/unpack GDAL Python source distribution
               run: |
-                curl -L -o gdal.tar.gz https://pypi.io/packages/source/g/gdal/gdal-$GDAL_VERSION.tar.gz
+                curl -L -o gdal.tar.gz https://pypi.io/packages/source/g/gdal/gdal-${{ env.GDAL_VERSION }}.tar.gz
                 tar -xzf gdal.tar.gz
             - name: Build wheels
               uses: pypa/cibuildwheel@v2.22
               env:
                 CIBW_ENVIRONMENT: PATH=${{ steps.install-gdal.outputs.GDAL_BIN }}:$PATH
               with:
-                package-dir: gdal-$GDAL_VERSION
+                package-dir: gdal-${{ env.GDAL_VERSION }}
             - uses: actions/upload-artifact@v4
               with:
                 name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
