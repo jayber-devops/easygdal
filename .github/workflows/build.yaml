@@ -1,0 +1,56 @@
+name: Build wheels
+
+on:
+    workflow_dispatch:
+        inputs:
+            gdal_version:
+                description: 'GDAL version to build'
+                required: true
+                default: '3.9.2'
+
+env:
+    GDAL_VERSION: ${{ github.event.inputs.gdal_version }}
+
+jobs:
+    build:
+        runs-on: ${{ matrix.os }}
+        defaults:
+          run:
+            shell: bash -el {0}
+        strategy:
+            matrix:
+                os: [
+                    macos-13, # macOS Ventura (13) - Intel
+                    macos-14, # macOS Sonoma (14) - Apple Silicon
+                    ubuntu-24.04,
+                    windows-2022,
+                ]
+            fail-fast: false
+        steps:
+            - uses: actions/checkout@v4
+            - name: Set up QEMU # Enables building Linux aarch64 (ARM) wheels
+              if: runner.os == 'Linux'
+              uses: docker/setup-qemu-action@v3
+              with:
+                platforms: all
+            - uses: conda-incubator/setup-miniconda@v3
+              with:
+                auto-update-conda: true
+            - name: Install GDAL
+              run: conda install -c conda-forge libgdal=$GDAL_VERSION
+            - name: Download/unpack GDAL Python source distribution
+              run: |
+                curl -L -o gdal.tar.gz https://pypi.io/packages/source/g/gdal/gdal-$GDAL_VERSION.tar.gz
+                tar -xzf gdal.tar.gz
+            - name: Build wheels
+              uses: pypa/cibuildwheel@v2.22
+              env:
+                # configure cibuildwheel to build native archs ('auto'), and some
+                # emulated ones
+                CIBW_ARCHS_LINUX: auto aarch64 ppc64le s390x
+              with:
+                package-dir: gdal-$GDAL_VERSION
+            - uses: actions/upload-artifact@v4
+              with:
+                name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
+                path: ./wheelhouse/*.whl
