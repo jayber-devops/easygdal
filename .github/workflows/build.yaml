@@ -1,56 +1,282 @@
-name: Build wheels
+name: Release
 
 on:
-    workflow_dispatch:
-        inputs:
-            gdal_version:
-                description: 'GDAL version to build'
-                required: true
-                default: '3.9.2'
-
-env:
-    GDAL_VERSION: ${{ github.event.inputs.gdal_version }}
+  workflow_dispatch:
+    inputs:
+      gdal-version:
+        description: 'GDAL version to build against (default: 3.10.3)'
+        required: false
+        default: '3.11.0'
+      gdal-version-vcpkg-port-version:
+        description: 'GDAL vcpkg port version to build against (default: 0)'
+        required: false
+        default: '0'
 
 jobs:
-    build:
-        runs-on: ${{ matrix.os }}
-        defaults:
-          run:
-            shell: bash -el {0}
-        strategy:
-            matrix:
-                os: [
-                    macos-13, # macOS Ventura (13) - Intel
-                    macos-14, # macOS Sonoma (14) - Apple Silicon
-                    ubuntu-24.04,
-                    windows-2022,
-                ]
-            fail-fast: false
-        steps:
-            - uses: actions/checkout@v4
-            - name: Set up QEMU # Enables building Linux aarch64 (ARM) wheels
-              if: runner.os == 'Linux'
-              uses: docker/setup-qemu-action@v3
-              with:
-                platforms: all
-            - uses: conda-incubator/setup-miniconda@v3
-              with:
-                auto-update-conda: true
-            - name: Install GDAL
-              run: conda install -c conda-forge libgdal=$GDAL_VERSION
-            - name: Download/unpack GDAL Python source distribution
-              run: |
-                curl -L -o gdal.tar.gz https://pypi.io/packages/source/g/gdal/gdal-$GDAL_VERSION.tar.gz
-                tar -xzf gdal.tar.gz
-            - name: Build wheels
-              uses: pypa/cibuildwheel@v2.22
-              env:
-                # configure cibuildwheel to build native archs ('auto'), and some
-                # emulated ones
-                CIBW_ARCHS_LINUX: auto aarch64 ppc64le s390x
-              with:
-                package-dir: gdal-$GDAL_VERSION
-            - uses: actions/upload-artifact@v4
-              with:
-                name: wheels-${{ matrix.os }}-${{ strategy.job-index }}
-                path: ./wheelhouse/*.whl
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      vcpkg-sha: ${{ steps.vcpkg-sha.outputs.vcpkg-sha }}
+    steps:
+      - name: Checkout vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          sparse-checkout: |
+            versions/g-/gdal.json
+          sparse-checkout-cone-mode: false
+
+      - id: vcpkg-sha
+        name: Get vcpkg SHA for version
+        run: |
+          gdal_vcpkg_sha=$(
+            # --exit-status forces failure if no match
+            # --raw-output to get raw string, not JSON string (wrapped in quotes)
+            jq --exit-status --raw-output --arg gdal_version "${{ inputs.gdal-version }}" --arg gdal_port_version "${{ inputs.gdal-version-vcpkg-port-version }}" \
+              '.versions[] | select(.["version-semver"] == $gdal_version)| select(.["port-version"]|tostring == $gdal_port_version) | .["git-tree"]' \
+              versions/g-/gdal.json
+          ) || (echo "No match found for GDAL version ${{ inputs.gdal-version }} port version ${{ inputs.gdal-version-vcpkg-port-version }}" && exit 1)
+          
+          echo "Found $gdal_vcpkg_sha for v${{ inputs.gdal-version }}, port ${{ inputs.gdal-version-vcpkg-port-version }}"
+          echo "vcpkg-sha=$gdal_vcpkg_sha" >> $GITHUB_OUTPUT
+      - run: |
+          exit 1 # temporary to test workflow
+  build-wheels-linux:
+    name: Build wheels on Linux
+    runs-on: ${{ matrix.os }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # use manylinux2014 for older glibc platforms until discontinued
+          - wheel_name: "pyogrio-wheel-linux-manylinux2014_x86_64"
+            container: "ci/manylinux2014_x86_64-vcpkg-gdal.Dockerfile"
+            os: ubuntu-latest
+            arch: x86_64
+
+          # use manylinux_2_28 for any platforms with glibc>=2.28
+          - wheel_name: "pyogrio-wheel-linux-manylinux_2_28_x86_64"
+            container: "ci/manylinux_2_28_x86_64-vcpkg-gdal.Dockerfile"
+            os: ubuntu-latest
+            arch: x86_64
+
+          - wheel_name: "pyogrio-wheel-linux-manylinux_2_28_aarch64"
+            container: "ci/manylinux_2_28_aarch64-vcpkg-gdal.Dockerfile"
+            os: ubuntu-24.04-arm
+            arch: aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+          buildkitd-flags: --debug
+
+      - name: Build Docker image with vcpkg and gdal
+        # using build-push-action (without push) to make use of cache arguments
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.container }}
+          tags: manylinux-${{ matrix.arch }}-vcpkg-gdal:latest
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          BUILDKIT_PROGRESS: plain
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.wheel_name }}
+          path: ./wheelhouse/*.whl
+          compression-level: 0
+
+  build-wheels-mac-win:
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: "macos-13"
+            triplet: "x64-osx-dynamic-release"
+            arch: x86_64
+            vcpkg_cache: "/Users/runner/.cache/vcpkg/archives"
+            vcpkg_logs: "/usr/local/share/vcpkg/buildtrees/**/*.log"
+
+          - os: "macos-13"
+            triplet: "arm64-osx-dynamic-release"
+            arch: arm64
+            vcpkg_cache: "/Users/runner/.cache/vcpkg/archives"
+            vcpkg_logs: "/usr/local/share/vcpkg/buildtrees/**/*.log"
+
+          - os: "windows-2019"
+            triplet: "x64-windows-dynamic-release"
+            arch: AMD64
+            # windows requires windows-specific paths
+            vcpkg_cache: "c:\\vcpkg\\installed"
+            vcpkg_logs: "c:\\vcpkg\\buildtrees\\**\\*.log"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        id: vcpkgcache
+        with:
+          path: |
+            ${{ matrix.vcpkg_cache }}
+          # bump the last digit to avoid using previous build cache
+          key: ${{ matrix.os }}-${{ matrix.arch }}-vcpkg-gdal3.10.3-cache0
+
+      # MacOS build requires aclocal, which is part of automake, but appears
+      # to be missing in default image
+      - name: Reinstall automake
+        if: runner.os == 'macOS'
+        run: |
+          brew reinstall automake
+          echo $(which aclocal)
+
+      - name: Checkout specific version of vcpkg
+        shell: bash
+        run: |
+          cd $VCPKG_INSTALLATION_ROOT
+          # on mac the clone is not clean, otherwise git pull fails
+          git reset --hard
+          # pull specific commit with desired GDAL version
+          git pull
+          git checkout 66c1c9852bb30bd87285e77cc775072046d51fc6
+
+      - name: Install GDAL
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+        shell: bash
+        run: |
+          vcpkg install --overlay-triplets=./ci/custom-triplets --feature-flags="versions,manifests" --x-manifest-root=./ci --x-install-root=$VCPKG_INSTALLATION_ROOT/installed
+          vcpkg list
+
+      - name: Upload vcpkg build logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: easygdal-vcpkg-logs-${{ matrix.triplet }}
+          path: ${{ matrix.vcpkg_logs }}
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          # CIBW needs to know triplet for the correct install path
+          VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+          CIBW_ARCHS: ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easygdal-wheel-${{ matrix.triplet }}
+          path: ./wheelhouse/*.whl
+          compression-level: 0
+
+  test-wheels:
+    name: Test wheels on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    needs: [build-wheels-linux, build-wheels-mac-win]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          [
+            "ubuntu-latest",
+            "ubuntu-22.04",
+            "ubuntu-24.04-arm",
+            "windows-latest",
+            "macos-13",
+            "macos-latest",
+          ]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: "ubuntu-latest"
+            artifact: pyogrio-wheel-linux-manylinux2014_x86_64
+          - os: "ubuntu-latest"
+            artifact: pyogrio-wheel-linux-manylinux_2_28_x86_64
+          - os: "ubuntu-22.04"
+            artifact: pyogrio-wheel-linux-manylinux_2_28_x86_64
+          - os: "ubuntu-24.04-arm"
+            artifact: pyogrio-wheel-linux-manylinux_2_28_aarch64
+          - os: "windows-latest"
+            artifact: pyogrio-wheel-x64-windows-dynamic-release
+          - os: "macos-13"
+            artifact: pyogrio-wheel-x64-osx-dynamic-release
+          - os: "macos-latest"
+            artifact: pyogrio-wheel-arm64-osx-dynamic-release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Create virtual environment (Linux / MacOS)
+        # use uv to create a virtual environment, then add it to environment
+        # variables so that it is automatically activated and can be used for
+        # tests below
+        if: ${{ runner.os != 'Windows' }}
+        run: |
+          uv venv .venv
+          echo "VIRTUAL_ENV=.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+
+      - name: Create virtual environment (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: |
+          uv venv .venv
+          "VIRTUAL_ENV=.venv" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$PWD/.venv/Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Download wheels from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheelhouse
+
+      - name: Install dependencies and easygdal wheel
+        shell: bash
+        run: |
+          if [ ${{ matrix.python-version }} != "3.13" ]; then
+            uv pip install -r ci/requirements-wheel-test.txt
+          else
+            uv pip install pytest numpy certifi packaging
+          fi
+          uv pip install --no-cache --pre --no-index --find-links wheelhouse easygdal
+          if [ ${{ matrix.python-version }} != "3.13" ]; then
+            uv pip install --no-deps geopandas
+          fi
+          uv pip list
+
+      - name: Run tests
+        shell: bash
+        # virtual environment is automatically activated
+        run: |
+          cd ..
+          uv run python -c "import easygdal; print(f'GDAL version: {easygdal.__gdal_version__}\nGEOS version: {easygdal.__gdal_geos_version__}')"
+          uv run python -m pytest --pyargs pyogrio.tests -v

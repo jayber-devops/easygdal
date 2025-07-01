@@ -1,0 +1,9 @@
+# pytest 8.0 gives permission error (https://github.com/pytest-dev/pytest/issues/11904)
+pytest<8
+# dependencies of geopandas (installed separately with --no-deps to avoid fiona)
+pandas
+pyproj ; (python_version < '3.12') or (python_full_version >= '3.12.1')
+shapely>=2 ; (python_version < '3.12') or (python_full_version >= '3.12.1')
+packaging
+# optional test dependencies
+pyarrow ; (python_version < '3.12') or (python_full_version >= '3.12.1')

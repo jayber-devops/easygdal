@@ -1,0 +1,10 @@
+name: test
+channels:
+  - conda-forge
+dependencies:
+  - numpy
+  - libgdal-core
+  - pytest
+  - shapely>=2
+  - geopandas-base
+  - pyarrow-core
